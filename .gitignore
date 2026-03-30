@@ -1,0 +1,41 @@
+# 1. Thư viện (Dependencies)
+node_modules/
+
+# 2. Biến môi trường & Bảo mật (Secrets/Env)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.pem
+*.key
+
+# 3. Log files (Logs)
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 4. Thư mục tạm & Upload (Temp/Uploads)
+uploads/
+tmp/
+temp/
+
+# 5. OS & Editor (System files)
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# 6. Test & Coverage
+coverage/
+.nyc_output/
+
+# 7. Claude Code (local config)
+.claude/CLAUDE.local.md
