@@ -17,7 +17,7 @@ const MAX_CHAPTERS_PER_BROWSER = 5;  // Chế độ 2: đóng/mở Chrome sau N 
 
 // Cấu hình cào danh sách
 const SCRAPE_LIST_URL = 'https://mangahub.io/popular';
-const MAX_STORIES_TO_CRAWL = 30;
+const MAX_STORIES_TO_CRAWL = 100;
 
 // Thay vì hardcode danh sách, hãy để biến let và lấy tự động từ MangaHub
 let storyUrls = [];

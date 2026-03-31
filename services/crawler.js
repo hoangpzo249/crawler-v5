@@ -313,7 +313,15 @@ class CrawlerService {
         let pageNum = 1;
 
         while (allLinks.length < limit) {
-            const pageUrl = `${url}?page=${pageNum}`;
+            let pageUrl = url;
+            if (pageNum > 1) {
+                if (url.includes('mangahub.io')) {
+                    pageUrl = url.endsWith('/') ? `${url}page/${pageNum}` : `${url}/page/${pageNum}`;
+                } else {
+                    pageUrl = url.includes('?') ? `${url}&page=${pageNum}` : `${url}?page=${pageNum}`;
+                }
+            }
+            
             console.log(`   🔎 Đang quét link từ trang: ${pageUrl}`);
             
             let tabData = null;
