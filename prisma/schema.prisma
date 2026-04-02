@@ -1,0 +1,190 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearchPostgres"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS (Dùng chung với Backend, phải y hệt)
+// ============================================================
+
+enum ComicStatus {
+  ONGOING
+  COMPLETED
+  HIATUS
+  DROPPED
+}
+
+enum ComicType {
+  MANGA
+  MANHWA
+  MANHUA
+  COMIC
+}
+
+enum MatureGroup {
+  MALE
+  FEMALE
+  BOTH
+}
+
+// Enum riêng cho Crawler (có thể để đây)
+enum JobType {
+  FETCH_NEW_CHAPTERS
+  UPLOAD_CDN_IMAGES
+}
+
+enum JobStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+// ============================================================
+// BẢNG DÙNG CHUNG VỚI BACKEND (Copy 100% y hệt BE)
+// ============================================================
+
+model Comic {
+  id               String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug             String      @unique
+  title            String
+  altTitles        String[]    @map("alt_titles")
+  type             ComicType   @default(MANGA)
+  status           ComicStatus @default(ONGOING)
+  description      String?     @db.Text
+  authors          String[]
+  artists          String[]
+
+  coverScrapedUrl  String?     @map("cover_scraped_url")
+  coverCdnUrl      String?     @map("cover_cdn_url")
+
+  totalViews       Int         @default(0) @map("total_views")
+  monthlyViews     Int         @default(0) @map("monthly_views")
+  weeklyViews      Int         @default(0) @map("weekly_views")
+  dailyViews       Int         @default(0) @map("daily_views")
+  ratingAvg        Float       @default(0) @map("rating_avg")
+  ratingCount      Int         @default(0) @map("rating_count")
+  bookmarksCount   Int         @default(0) @map("bookmarks_count")
+
+  latestChapters   Json?       @map("latest_chapters") @db.JsonB
+
+  sourceUrl        String?     @map("source_url")
+  lastCrawledAt    DateTime?   @map("last_crawled_at")
+
+  isHidden         Boolean     @default(false) @map("is_hidden")
+
+  // Mature content classification
+  isMature         Boolean      @default(false) @map("is_mature")
+  matureGroup      MatureGroup? @map("mature_group")
+
+  // Full-text search vector (managed by PostgreSQL trigger, not Prisma)
+  searchVector     Unsupported("tsvector")? @map("search_vector")
+
+  // Nối với Crawler
+  crawlSourceId    String?     @map("crawl_source_id") @db.Uuid
+  crawlSource      CrawlSource? @relation(fields: [crawlSourceId], references: [id])
+  crawlJobs        CrawlJob[]
+
+  chapters         Chapter[]
+  comicGenres      ComicGenre[]
+
+  createdAt        DateTime    @default(now()) @map("created_at")
+  updatedAt        DateTime    @updatedAt @map("updated_at")
+
+  @@index([status, updatedAt(sort: Desc)])
+  @@index([status, totalViews(sort: Desc)])
+  @@index([status, weeklyViews(sort: Desc)])
+  @@index([ratingAvg(sort: Desc), status])
+  @@index([isHidden])
+  @@index([isMature, matureGroup, updatedAt(sort: Desc)])
+  @@map("comics")
+}
+
+model Chapter {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  comicId         String    @map("comic_id") @db.Uuid
+  chapterNumber   Float     @map("chapter_number")
+  title           String?
+  slug            String
+
+  imageSource     String    @default("scraped") @map("image_source")
+  pages           Json      @db.JsonB
+  cdnUploadedAt   DateTime? @map("cdn_uploaded_at")
+  viewCount       Int       @default(0) @map("view_count")
+
+  comic           Comic     @relation(fields: [comicId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@unique([comicId, chapterNumber])
+  @@index([comicId, chapterNumber(sort: Desc)])
+  @@index([comicId, slug])
+  @@map("chapters")
+}
+
+model Genre {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String       @unique
+  slug        String       @unique
+  description String?      @db.Text
+  comicCount  Int          @default(0) @map("comic_count")
+
+  // Hide this genre from filter list when user has 18+ mode off
+  isMature    Boolean      @default(false) @map("is_mature")
+
+  comicGenres ComicGenre[]
+
+  @@map("genres")
+}
+
+model ComicGenre {
+  comicId String @map("comic_id") @db.Uuid
+  genreId String @map("genre_id") @db.Uuid
+
+  comic   Comic  @relation(fields: [comicId], references: [id], onDelete: Cascade)
+  genre   Genre  @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([comicId, genreId])
+  @@index([genreId])
+  @@map("comic_genres")
+}
+
+// ============================================================
+// BẢNG RIÊNG CỦA CRAWLER (Quản lý tiến trình)
+// ============================================================
+
+model CrawlSource {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String
+  baseUrl     String       @map("base_url")
+  selectors   Json?        @default("{}") @db.JsonB
+  isActive    Boolean      @default(true) @map("is_active")
+  analyzedAt  DateTime?    @map("analyzed_at")
+
+  comics      Comic[]
+  crawlJobs   CrawlJob[]
+
+  @@map("crawl_sources")
+}
+
+model CrawlJob {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sourceId     String      @map("source_id") @db.Uuid
+  comicId      String      @map("comic_id") @db.Uuid
+  type         JobType
+  status       JobStatus   @default(RUNNING)
+  result       Json?       @db.JsonB
+  
+  source       CrawlSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  comic        Comic       @relation(fields: [comicId], references: [id], onDelete: Cascade)
+
+  startedAt    DateTime    @default(now()) @map("started_at")
+  completedAt  DateTime?   @map("completed_at")
+
+  @@map("crawl_jobs")
+}

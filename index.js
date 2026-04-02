@@ -1,23 +1,20 @@
 require('dotenv').config();
-const mongoose = require('mongoose');
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+
 const crawler = require('./services/crawler');
-const Comic = require('./models/Comic');
-const Chapter = require('./models/Chapter');
-const Genre = require('./models/Genre');
-const CrawlSource = require('./models/CrawlSource');
-const CrawlJob = require('./models/CrawlJob');
 const ProxyManager = require('./services/proxyManager');
 const WorkerPool = require('./services/workerPool');
 
 // ===== CẤU HÌNH =====
 const BATCH_SIZE = 50;
-const TARGET_CHAPTERS = 20;
+const TARGET_CHAPTERS = 10;
 const REST_BETWEEN_BATCHES = 5 * 60 * 1000;
 const MAX_CHAPTERS_PER_BROWSER = 5;  // Chế độ 2: đóng/mở Chrome sau N chap để dọn RAM
 
 // Cấu hình cào danh sách
 const SCRAPE_LIST_URL = 'https://mangahub.io/popular';
-const MAX_STORIES_TO_CRAWL = 100;
+const MAX_STORIES_TO_CRAWL = 5;
 
 // Thay vì hardcode danh sách, hãy để biến let và lấy tự động từ MangaHub
 let storyUrls = [];
@@ -43,35 +40,55 @@ const MANGAHUB_SELECTORS = {
 };
 
 async function getOrCreateSource() {
-    return await CrawlSource.findOneAndUpdate(
-        { base_url: 'https://mangahub.io' },
-        {
-            name: 'MangaHub',
-            base_url: 'https://mangahub.io',
-            selectors: MANGAHUB_SELECTORS,
-            is_active: true,
-            analyzed_at: new Date(),
-        },
-        { upsert: true, new: true }
-    );
+    let source = await prisma.crawlSource.findFirst({
+        where: { baseUrl: 'https://mangahub.io' }
+    });
+
+    if (!source) {
+        source = await prisma.crawlSource.create({
+            data: {
+                name: 'MangaHub',
+                baseUrl: 'https://mangahub.io',
+                selectors: MANGAHUB_SELECTORS,
+                isActive: true,
+                analyzedAt: new Date(),
+            }
+        });
+    }
+    return source;
 }
 
 async function upsertGenres(genreNames) {
-    const slugs = [];
+    const genres = [];
     for (const name of genreNames) {
         const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
         if (!slug) continue;
-        await Genre.findOneAndUpdate({ slug }, { name, slug }, { upsert: true });
-        slugs.push(slug);
+        
+        try {
+            const genre = await prisma.genre.upsert({
+                where: { slug },
+                update: { name },
+                create: { name, slug }
+            });
+            genres.push({ id: genre.id });
+        } catch (e) {
+            const genre = await prisma.genre.findUnique({ where: { slug } });
+            if (genre) genres.push({ id: genre.id });
+        }
     }
-    return slugs;
+    return genres;
 }
 
 async function updateGenreCounts() {
-    const genres = await Genre.find();
+    const genres = await prisma.genre.findMany();
     for (const genre of genres) {
-        const count = await Comic.countDocuments({ genres: genre.slug });
-        await Genre.findByIdAndUpdate(genre._id, { comic_count: count });
+        const count = await prisma.comicGenre.count({
+            where: { genreId: genre.id }
+        });
+        await prisma.genre.update({
+            where: { id: genre.id },
+            data: { comicCount: count }
+        });
     }
     console.log(`📊 Đã cập nhật comic_count cho ${genres.length} genres`);
 }
@@ -98,50 +115,63 @@ async function scrapeStoryInfo(url, proxyManager, source) {
     if (!info || !info.title) return null;
 
     const comicSlug = info.slug.replace(/_\d+$/, '');
-    const genreSlugs = await upsertGenres(info.genres);
+    const genresToConnect = await upsertGenres(info.genres);
 
-    const comic = await Comic.findOneAndUpdate(
-        { slug: comicSlug },
-        {
+    const comic = await prisma.comic.upsert({
+        where: { slug: comicSlug },
+        update: {
+            title: info.title,
+            authors: info.author || [],
+            artists: info.artist || [],
+            description: info.description,
+            altTitles: info.alt_titles || [],
+            status: (info.status || 'ongoing').toUpperCase(),
+            coverScrapedUrl: info.thumbnail || '',
+            // Bỏ dòng coverCdnUrl: '', để tránh xoá mất link CDN đã upload do BE làm
+            type: 'MANHWA',
+            crawlSourceId: source.id,
+            sourceUrl: url,
+            lastCrawledAt: new Date(),
+            comicGenres: {
+                deleteMany: {},
+                create: genresToConnect.map(g => ({ genreId: g.id }))
+            }
+        },
+        create: {
             slug: comicSlug,
             title: info.title,
-            authors: info.author, // Đã là mảng từ crawler
-            artists: info.artist, // Đã là mảng từ crawler
+            authors: info.author || [],
+            artists: info.artist || [],
             description: info.description,
-            alt_titles: info.alt_titles, // Đã là mảng split(';') từ crawler
-            status: info.status,
-            genres: genreSlugs,
-            cover: {
-                scraped_url: info.thumbnail || '',
-                cdn_url: '',
-                active_source: 'scraped',
-            },
-            type: 'manhwa',
-            crawl_info: {
-                source_id: source._id,
-                source_url: url,
-                last_crawled_at: new Date(),
-            },
-        },
-        { upsert: true, new: true }
-    );
-
-    const existingCount = await Chapter.countDocuments({
-        comic_id: comic._id,
-        'pages.0': { $exists: true },
+            altTitles: info.alt_titles || [],
+            status: (info.status || 'ongoing').toUpperCase(),
+            coverScrapedUrl: info.thumbnail || '',
+            coverCdnUrl: '',
+            type: 'MANHWA',
+            crawlSourceId: source.id,
+            sourceUrl: url,
+            lastCrawledAt: new Date(),
+            comicGenres: {
+                create: genresToConnect.map(g => ({ genreId: g.id }))
+            }
+        }
     });
+
+    const chaptersInDb = await prisma.chapter.findMany({
+        where: { comicId: comic.id },
+        select: { chapterNumber: true, pages: true }
+    });
+
+    // Lọc lại các chapter đã cào có trang > 0
+    const existingChapNums = new Set(
+        chaptersInDb.filter(c => Array.isArray(c.pages) && c.pages.length > 0).map(c => c.chapterNumber)
+    );
+    const existingCount = existingChapNums.size;
 
     if (existingCount >= TARGET_CHAPTERS) {
         console.log(`   ⏭️ ${info.title} đã đủ ${existingCount}/${TARGET_CHAPTERS} chap, SKIP!`);
         return null;
     }
-
-    const existingChapNums = new Set(
-        (await Chapter.find(
-            { comic_id: comic._id, 'pages.0': { $exists: true } },
-            { chapter_number: 1 }
-        )).map(c => c.chapter_number)
-    );
 
     const allChapters = info.chapterLinks.slice(0, TARGET_CHAPTERS);
     const chaptersToScrape = allChapters.filter(cObj => {
@@ -159,40 +189,54 @@ async function scrapeStoryInfo(url, proxyManager, source) {
 // ================================================================
 async function saveChapter(comic, comicSlug, chapterNumber, chapterTitle, seoSlug, images, workerId) {
     const pages = images.map((imgUrl, idx) => ({
-        page_number: idx + 1,
-        scraped_url: imgUrl,
-        cdn_url: '',
+        pageNumber: idx + 1,
+        scrapedUrl: imgUrl,
+        cdnUrl: '',
     }));
 
-    const chapter = await Chapter.findOneAndUpdate(
-        { comic_id: comic._id, chapter_number: chapterNumber },
-        {
-            comic_id: comic._id,
-            comic_slug: comicSlug,
-            chapter_number: chapterNumber,
+    const chapter = await prisma.chapter.upsert({
+        where: {
+            comicId_chapterNumber: {
+                comicId: comic.id,
+                chapterNumber: chapterNumber
+            }
+        },
+        update: {
             title: chapterTitle,
             slug: seoSlug,
-            image_source: 'scraped',
             pages: pages,
         },
-        { upsert: true, new: true }
-    );
+        create: {
+            comicId: comic.id,
+            chapterNumber: chapterNumber,
+            title: chapterTitle,
+            slug: seoSlug,
+            imageSource: 'scraped',
+            pages: pages,
+        }
+    });
 
     console.log(`   ✅ Worker-${workerId} | ${comic.title} - ${chapterTitle} | Trang: ${pages.length}`);
 
-    // Cập nhật latest_chapters (atomic từ DB)
-    const latestFromDb = await Chapter.find(
-        { comic_id: comic._id, 'pages.0': { $exists: true } },
-        { chapter_number: 1, slug: 1, created_at: 1 }
-    ).sort({ chapter_number: -1 }).limit(3);
+    // Lấy 3 chapter gần nhất
+    const allChapters = await prisma.chapter.findMany({
+        where: { comicId: comic.id },
+        select: { id: true, chapterNumber: true, slug: true, createdAt: true, pages: true },
+        orderBy: { chapterNumber: 'desc' }
+    });
 
-    await Comic.findByIdAndUpdate(comic._id, {
-        latest_chapters: latestFromDb.map(c => ({
-            chapter_id: c._id,
-            chapter_number: c.chapter_number,
-            slug: c.slug,
-            created_at: c.created_at || new Date(),
-        })),
+    const latestValidChapters = allChapters.filter(c => Array.isArray(c.pages) && c.pages.length > 0).slice(0, 3);
+
+    await prisma.comic.update({
+        where: { id: comic.id },
+        data: {
+            latestChapters: latestValidChapters.map(c => ({
+                chapterId: c.id,
+                chapterNumber: c.chapterNumber,
+                slug: c.slug,
+                createdAt: c.createdAt.toISOString() || new Date().toISOString(),
+            }))
+        }
     });
 
     return chapter;
@@ -432,8 +476,7 @@ process.on('SIGINT', async () => {
 // ================================================================
 async function startCrawl() {
     try {
-        await mongoose.connect(process.env.MONGODB_URI);
-        console.log("🚀 Đã kết nối MongoDB.");
+        console.log("🚀 Đã tải Prisma và bắt đầu kết nối PostgreSQL.");
 
         const source = await getOrCreateSource();
         console.log(`📡 CrawlSource: ${source.name}`);
@@ -502,14 +545,16 @@ async function startCrawl() {
             // ===== Tạo CrawlJobs =====
             const crawlJobs = new Map();
             for (const si of storyInfos) {
-                const job = await CrawlJob.create({
-                    source_id: source._id,
-                    comic_id: si.comic._id,
-                    type: 'fetch_new_chapters',
-                    status: 'running',
-                    started_at: new Date(),
+                const job = await prisma.crawlJob.create({
+                    data: {
+                        sourceId: source.id,
+                        comicId: si.comic.id,
+                        type: 'FETCH_NEW_CHAPTERS',
+                        status: 'RUNNING',
+                        startedAt: new Date(),
+                    }
                 });
-                crawlJobs.set(si.comic._id.toString(), { job, found: 0, error: '' });
+                crawlJobs.set(si.comic.id.toString(), { job, found: 0, error: '' });
             }
 
             // ===== PHASE 2: Chọn chế độ cào =====
@@ -533,7 +578,7 @@ async function startCrawl() {
                                 source: si.source,
                             }, pm, wId);
 
-                            const tracker = crawlJobs.get(si.comic._id.toString());
+                            const tracker = crawlJobs.get(si.comic.id.toString());
                             if (result === 'success') tracker.found++;
                             else tracker.error = `Fail: ${cObj.title}`;
                             return result;
@@ -554,7 +599,7 @@ async function startCrawl() {
                     storyPool.addJob(async (pm, wId) => {
                         const { chaptersFound, errorMessage } = await scrapeStoryWithReuse(si, pm, wId);
 
-                        const tracker = crawlJobs.get(si.comic._id.toString());
+                        const tracker = crawlJobs.get(si.comic.id.toString());
                         tracker.found = chaptersFound;
                         if (errorMessage) tracker.error = errorMessage;
                         return chaptersFound > 0 ? 'success' : 'failed';
@@ -566,19 +611,34 @@ async function startCrawl() {
 
             // ===== Cập nhật CrawlJobs + stats =====
             for (const si of storyInfos) {
-                const tracker = crawlJobs.get(si.comic._id.toString());
-                const totalChapters = await Chapter.countDocuments({ comic_id: si.comic._id });
-                await Comic.findByIdAndUpdate(si.comic._id, { 'stats.total_chapters': totalChapters });
+                const tracker = crawlJobs.get(si.comic.id.toString());
+                const totalChapters = await prisma.chapter.count({ where: { comicId: si.comic.id } });
+                
+                // Fetch stats, update views/total chapters
+                const comicData = await prisma.comic.findUnique({ where: { id: si.comic.id } });
+                let latestChaptersRaw = si.comic.latestChapters || [];
+                if (typeof latestChaptersRaw === 'string') latestChaptersRaw = JSON.parse(latestChaptersRaw);
 
-                const status = tracker.found > 0 ? 'completed' : (tracker.error ? 'failed' : 'completed');
-                await CrawlJob.findByIdAndUpdate(tracker.job._id, {
-                    status,
-                    completed_at: new Date(),
-                    result: {
-                        chapters_found: tracker.found,
-                        images_uploaded: 0,
-                        error_message: status === 'failed' ? tracker.error : '',
-                    },
+                await prisma.comic.update({
+                    where: { id: si.comic.id },
+                    data: {
+                        lastCrawledAt: new Date(),
+                    }
+                });
+
+                const status = tracker.found > 0 ? 'COMPLETED' : (tracker.error ? 'FAILED' : 'COMPLETED');
+                
+                await prisma.crawlJob.update({
+                    where: { id: tracker.job.id },
+                    data: {
+                        status: status,
+                        completedAt: new Date(),
+                        result: {
+                            chapters_found: tracker.found,
+                            images_uploaded: 0,
+                            error_message: status === 'FAILED' ? tracker.error : '',
+                        }
+                    }
                 });
 
                 console.log(`   📊 ${si.info.title} | ${tracker.found} chap mới | ${status}`);
